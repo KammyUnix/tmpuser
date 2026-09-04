@@ -1,3 +1,4 @@
+![TMPUser demo](assets/tmpuser-demo.gif)
 # TMPUser
 
 when you don’t wanna mess up your home directory, but you’re too lazy for containers or VMs.
