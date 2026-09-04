@@ -12,13 +12,13 @@ when you don’t wanna mess up your home directory, but you’re too lazy for co
 
 tl;dr: **temu docker/podman**
 
-TMPUser basically makes your home directory temporarily live in /tmp, making other apps think:
+TMPUser basically makes your home directory temporarily live in '/tmp', making other apps think:
 
-“ah yes, my user’s home directory is /tmp. average classic day.”
+> “ah yes, my user’s home directory is '/tmp'. average classic day.”
 
-think of it like chrooting into /tmp, but kernel and users and etc stay same, except path and home directory variables
+think of it like chrooting into '/tmp', but kernel and users and etc stay same, except path and home directory variables
 
-unless.. you just use it to create /tmp/$user directory and don't use the main feature of TMPUser. what a psychopath?!
+unless.. you just use it to create '/tmp/$user' directory and don't use the main feature of TMPUser. what a psychopath?!
 
 ## how does it work?
 
