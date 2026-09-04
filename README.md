@@ -18,7 +18,7 @@ TMPUser basically makes your home directory temporarily live in /tmp, making oth
 
 think of it like chrooting into /tmp, but kernel and users and etc stay same, except path and home directory variables
 
-unless.. you just use it to create /tmp/$user directory and don't use the main feature of TMPUser. what a pschyopath?!
+unless.. you just use it to create /tmp/$user directory and don't use the main feature of TMPUser. what a psychopath?!
 
 ## how does it work?
 
