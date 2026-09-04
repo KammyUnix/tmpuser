@@ -1,0 +1,1084 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$' \t\n'
+export LC_ALL=C
+
+USER_UID="$(id -u)"
+USER_NAME="$(id -un)"
+USER_ENTRY="$(getent passwd "$USER_UID")"
+REAL_HOME="$(printf '%s\n' "$USER_ENTRY" | cut -d: -f6)"
+LOGIN_SHELL="$(printf '%s\n' "$USER_ENTRY" | cut -d: -f7)"
+
+TMP_ROOT="/tmp"
+PREFIX="$TMP_ROOT/$USER_NAME"
+
+CONFIG_DIR="$REAL_HOME/.config/tmpuser"
+QUOTA_FILE="$CONFIG_DIR/quotas"
+LOCK_FILE="$CONFIG_DIR/quotas.lock"
+
+TMPUSER_TMP_FILE=""
+
+cleanup() {
+    if [[ -n "$TMPUSER_TMP_FILE" && -e "$TMPUSER_TMP_FILE" ]]; then
+        rm -f -- "$TMPUSER_TMP_FILE" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 ||
+        die "$1 is required."
+}
+
+for cmd in id getent awk cut find stat du mktemp mkdir mv rm rmdir cp sleep flock
+do
+    need_cmd "$cmd"
+done
+
+[[ "$USER_UID" =~ ^[0-9]+$ ]] ||
+    die "invalid UID."
+
+[[ "$USER_NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
+    die "unsupported username."
+
+[[ "$REAL_HOME" == /* && "$REAL_HOME" != "/" ]] ||
+    die "invalid home directory."
+
+[[ "$LOGIN_SHELL" == /* ]] ||
+    die "invalid login shell."
+
+[[ -d "$REAL_HOME" && ! -L "$REAL_HOME" ]] ||
+    die "invalid home directory."
+
+[[ -d "$TMP_ROOT" && ! -L "$TMP_ROOT" ]] ||
+    die "invalid /tmp."
+
+[[ "$(stat -c '%u' "$TMP_ROOT")" == "0" ]] ||
+    die "/tmp is not root-owned."
+
+TMP_MODE="$(stat -c '%a' "$TMP_ROOT")"
+(( 10#$TMP_MODE & 1000 )) ||
+    die "/tmp does not have the sticky bit."
+
+mkdir -p -- "$CONFIG_DIR"
+chmod 700 -- "$CONFIG_DIR"
+
+[[ ! -L "$CONFIG_DIR" ]] ||
+    die "configuration directory is a symlink."
+
+if [[ ! -e "$QUOTA_FILE" ]]; then
+    umask 077
+    : > "$QUOTA_FILE"
+fi
+
+if [[ ! -e "$LOCK_FILE" ]]; then
+    umask 077
+    : > "$LOCK_FILE"
+fi
+
+[[ -f "$QUOTA_FILE" && ! -L "$QUOTA_FILE" ]] ||
+    die "quota file is invalid."
+
+[[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] ||
+    die "lock file is invalid."
+
+chmod 600 -- "$QUOTA_FILE" "$LOCK_FILE"
+
+exec 9>>"$LOCK_FILE"
+
+lock_file() {
+    flock -x 9
+}
+
+unlock_file() {
+    flock -u 9
+}
+
+usage() {
+    cat <<'EOF'
+Usage: tmpuser [option]
+
+  -c          create normal workspace
+  -cr         create random workspace
+  -s          show all workspaces
+  -i          show workspace information
+  -d          delete workspace
+  -e          empty workspace
+  -q [SIZE]   set quota, or remove quota
+  -o          open shell inside workspace
+  -w          watch workspace usage
+  -f          open TMPUser TUI(default argument)
+  -h          show this help
+EOF
+}
+
+require_fzf() {
+    command -v fzf >/dev/null 2>&1 ||
+        die "fzf is required for this mode."
+}
+
+valid_name() {
+    local path="$1"
+    local base="${path##*/}"
+
+    [[ "$path" == "$PREFIX" ]] && return 0
+    [[ "$base" =~ ^${USER_NAME}-[A-Za-z0-9]{8}$ ]]
+}
+
+is_workspace() {
+    local path="$1"
+
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    valid_name "$path" || return 1
+
+    [[ "$(stat -c '%u' "$path" 2>/dev/null)" == "$USER_UID" ]] ||
+        return 1
+
+    return 0
+}
+
+workspace_list() {
+    local path
+
+    is_workspace "$PREFIX" 2>/dev/null &&
+        printf '%s\n' "$PREFIX"
+
+    while IFS= read -r -d '' path; do
+        is_workspace "$path" &&
+            printf '%s\n' "$path"
+    done < <(
+        find "$TMP_ROOT" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -user "$USER_UID" \
+            -name "${USER_NAME}-????????" \
+            -print0 2>/dev/null
+    )
+}
+
+fzf_workspace() {
+    local selected
+
+    require_fzf
+
+    selected="$(
+        workspace_list |
+            sort -u |
+            fzf \
+                --height=60% \
+                --layout=reverse \
+                --border \
+                --prompt='workspace > ' \
+                --header='enter: select • esc: back'
+    )" || return 1
+
+    [[ -n "$selected" ]] || return 1
+
+    is_workspace "$selected" ||
+        die "selected workspace is no longer valid."
+
+    printf '%s\n' "$selected"
+}
+
+pick_workspace() {
+    local -a paths
+
+    mapfile -t paths < <(workspace_list | sort -u)
+
+    case "${#paths[@]}" in
+        0)
+            printf 'no workspaces.\n' >&2
+            return 1
+            ;;
+        1)
+            printf '%s\n' "${paths[0]}"
+            ;;
+        *)
+            if command -v fzf >/dev/null 2>&1; then
+                fzf_workspace
+            else
+		    printf 'multiple workspaces exist. install fzf(if you have it, use -f).\n' >&2
+                return 1
+            fi
+            ;;
+    esac
+}
+
+parse_size() {
+    local input="$1"
+    local upper number unit multiplier result
+
+    upper="${input^^}"
+
+    [[ "$upper" =~ ^([0-9]+([.][0-9]{1,3})?)(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB)?$ ]] ||
+        return 1
+
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[3]:-B}"
+
+    case "$unit" in
+        B) multiplier=1 ;;
+        K|KB) multiplier=1000 ;;
+        KIB) multiplier=1024 ;;
+        M|MB) multiplier=1000000 ;;
+        MIB) multiplier=$((1024 ** 2)) ;;
+        G|GB) multiplier=1000000000 ;;
+        GIB) multiplier=$((1024 ** 3)) ;;
+        T|TB) multiplier=1000000000000 ;;
+        TIB) multiplier=$((1024 ** 4)) ;;
+        *) return 1 ;;
+    esac
+
+    result="$(
+        awk -v n="$number" -v m="$multiplier" '
+            BEGIN {
+                value = n * m
+                if (value < 1 || value > 9223372036854775807)
+                    exit 1
+                printf "%.0f\n", value
+            }
+        '
+    )" || return 1
+
+    [[ "$result" =~ ^[1-9][0-9]*$ ]] ||
+        return 1
+
+    printf '%s\n' "$result"
+}
+
+format_size() {
+    local bytes="$1"
+
+    awk -v b="$bytes" '
+        BEGIN {
+            if (b >= 1099511627776)
+                printf "%.2f TiB", b / 1099511627776
+            else if (b >= 1073741824)
+                printf "%.2f GiB", b / 1073741824
+            else if (b >= 1048576)
+                printf "%.2f MiB", b / 1048576
+            else if (b >= 1024)
+                printf "%.2f KiB", b / 1024
+            else
+                printf "%d B", b
+        }
+    '
+}
+
+usage_bytes() {
+    local path="$1"
+    local value
+
+    is_workspace "$path" || return 1
+
+    value="$(
+        du -sx --block-size=1 -- "$path" 2>/dev/null |
+            awk '$1 ~ /^[0-9]+$/ { print $1; exit }'
+    )" || return 1
+
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+
+    printf '%s\n' "$value"
+}
+
+get_quota() {
+    local path="$1"
+    local result
+
+    is_workspace "$path" || return 1
+
+    lock_file
+
+    result="$(
+        awk -F '\t' -v p="$path" '
+            $1 == p && $2 ~ /^[1-9][0-9]*$/ {
+                print $2
+                exit
+            }
+        ' "$QUOTA_FILE"
+    )"
+
+    unlock_file
+
+    [[ "$result" =~ ^[1-9][0-9]*$ ]] || return 1
+
+    printf '%s\n' "$result"
+}
+
+set_quota() {
+    local path="$1"
+    local quota="$2"
+    local tmp
+
+    is_workspace "$path" ||
+        die "invalid workspace."
+
+    [[ "$quota" =~ ^[1-9][0-9]*$ ]] ||
+        die "invalid quota."
+
+    lock_file
+
+    tmp="$(mktemp "$CONFIG_DIR/quotas.XXXXXX")"
+    chmod 600 -- "$tmp"
+    TMPUSER_TMP_FILE="$tmp"
+
+    awk -F '\t' -v p="$path" '$1 != p' "$QUOTA_FILE" > "$tmp"
+    printf '%s\t%s\n' "$path" "$quota" >> "$tmp"
+
+    chmod 600 -- "$tmp"
+    mv -- "$tmp" "$QUOTA_FILE"
+
+    TMPUSER_TMP_FILE=""
+    unlock_file
+}
+
+clear_quota() {
+    local path="$1"
+    local tmp
+
+    lock_file
+
+    tmp="$(mktemp "$CONFIG_DIR/quotas.XXXXXX")"
+    chmod 600 -- "$tmp"
+    TMPUSER_TMP_FILE="$tmp"
+
+    awk -F '\t' -v p="$path" '$1 != p' "$QUOTA_FILE" > "$tmp"
+
+    chmod 600 -- "$tmp"
+    mv -- "$tmp" "$QUOTA_FILE"
+
+    TMPUSER_TMP_FILE=""
+    unlock_file
+}
+
+clean_quotas() {
+    local tmp path quota
+
+    lock_file
+
+    tmp="$(mktemp "$CONFIG_DIR/quotas.XXXXXX")"
+    chmod 600 -- "$tmp"
+    TMPUSER_TMP_FILE="$tmp"
+
+    while IFS=$'\t' read -r path quota; do
+        [[ -n "$path" ]] || continue
+        [[ "$quota" =~ ^[1-9][0-9]*$ ]] || continue
+        is_workspace "$path" || continue
+
+        printf '%s\t%s\n' "$path" "$quota" >> "$tmp"
+    done < "$QUOTA_FILE"
+
+    chmod 600 -- "$tmp"
+    mv -- "$tmp" "$QUOTA_FILE"
+
+    TMPUSER_TMP_FILE=""
+    unlock_file
+}
+
+create_workspace() {
+    local random="${1:-0}"
+    local path
+
+    if (( random )); then
+        path="$(mktemp -d -p "$TMP_ROOT" "${USER_NAME}-XXXXXXXX")" ||
+            die "unable to create workspace."
+    else
+        if [[ -e "$PREFIX" ]]; then
+            [[ ! -L "$PREFIX" ]] ||
+                die "refusing to operate on symlink $PREFIX."
+
+            is_workspace "$PREFIX" ||
+                die "$PREFIX exists but is not a TMPUser workspace."
+
+            path="$PREFIX"
+        else
+            mkdir -- "$PREFIX" ||
+                die "unable to create workspace."
+
+            path="$PREFIX"
+        fi
+    fi
+
+    chmod 700 -- "$path"
+
+    is_workspace "$path" ||
+        die "workspace validation failed."
+
+    printf '%s\n' "$path"
+}
+
+delete_workspace() {
+    local path="$1"
+
+    is_workspace "$path" ||
+        die "workspace is no longer valid."
+
+    find "$path" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -exec rm -rf -- {} +
+
+    rmdir -- "$path" ||
+        die "unable to remove workspace."
+
+    clear_quota "$path" 2>/dev/null || true
+
+    printf 'deleted: %s\n' "$path"
+}
+
+empty_workspace() {
+    local path="$1"
+
+    is_workspace "$path" ||
+        die "workspace validation failed."
+
+    find "$path" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -exec rm -rf -- {} +
+
+    printf 'workspace emptied: %s\n' "$path"
+}
+
+show_status() {
+    local path used quota remaining percent
+    local found=0
+
+    clean_quotas
+
+    while IFS= read -r path; do
+        found=1
+
+        used="$(usage_bytes "$path")" || continue
+        quota="$(get_quota "$path" || true)"
+
+        printf '%s\n' "$path"
+        printf '  used: %s\n' "$(format_size "$used")"
+
+        if [[ "$quota" =~ ^[1-9][0-9]*$ ]]; then
+            printf '  quota: %s\n' "$(format_size "$quota")"
+
+            percent="$(
+                awk -v u="$used" -v q="$quota" \
+                    'BEGIN { printf "%.1f", u/q*100 }'
+            )"
+
+            if (( used > quota )); then
+                remaining=$((used - quota))
+                printf '  over by: %s\n' "$(format_size "$remaining")"
+                printf '  usage: %s%%\n' "$percent"
+                printf '  status: OVER QUOTA\n'
+            else
+                remaining=$((quota - used))
+                printf '  remaining: %s\n' "$(format_size "$remaining")"
+                printf '  usage: %s%%\n' "$percent"
+                printf '  status: OK\n'
+            fi
+        else
+            printf '  quota: none\n'
+        fi
+
+        printf '\n'
+    done < <(workspace_list | sort -u)
+
+    (( found )) || printf 'no workspaces.\n'
+}
+
+workspace_info() {
+    local path="$1"
+    local used quota files created modified
+
+    is_workspace "$path" ||
+        die "workspace is no longer valid."
+
+    used="$(usage_bytes "$path")" ||
+        die "unable to calculate workspace size."
+
+    quota="$(get_quota "$path" || true)"
+
+    files="$(
+        find "$path" -xdev -type f -print 2>/dev/null |
+            wc -l
+    )"
+
+    created="$(stat -c '%w' "$path" 2>/dev/null || stat -c '%y' "$path")"
+    modified="$(stat -c '%y' "$path")"
+
+    printf 'workspace: %s\n' "$path"
+
+    if [[ "$path" == "$PREFIX" ]]; then
+        printf 'type: normal\n'
+    else
+        printf 'type: random\n'
+    fi
+
+    printf 'owner: %s (%s)\n' "$USER_NAME" "$USER_UID"
+    printf 'size: %s\n' "$(format_size "$used")"
+    printf 'files: %s\n' "$files"
+    printf 'created: %s\n' "$created"
+    printf 'modified: %s\n' "$modified"
+
+    if [[ "$quota" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'quota: %s\n' "$(format_size "$quota")"
+    else
+        printf 'quota: none\n'
+    fi
+}
+
+confirm() {
+    local prompt="$1"
+    local answer
+
+    printf '%s [y/N] ' "$prompt"
+    read -r answer </dev/tty || answer=""
+
+    case "$answer" in
+        y|Y|yes|YES|Yes)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+copy_entry() {
+    local source="$1"
+    local workspace="$2"
+    local allow_external="${3:-false}"
+    local relative destination
+if [[ "$allow_external" != true ]]; then
+    [[ "$source" == "$REAL_HOME"/* ]] ||
+        die "selected path is outside HOME."
+fi
+
+    [[ -e "$source" ]] ||
+        die "selected path no longer exists."
+
+    [[ ! -L "$source" ]] ||
+        die "refusing to carry over symlink: $source"
+
+
+    relative="${source#"$REAL_HOME"/}"
+    destination="$workspace/$relative"
+
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$source" "$destination"
+}
+
+home_entries() {
+    find "$REAL_HOME" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -printf '%f\t%p\n' 2>/dev/null |
+        sort
+}
+
+carry_custom() {
+    local input path
+
+    printf 'path to carry over > ' > /dev/tty
+    read -r input </dev/tty || return 1
+
+    [[ -n "$input" ]] || return 1
+
+    if [[ "$input" == /* ]]; then
+        path="$input"
+    else
+        path="$REAL_HOME/$input"
+    fi
+
+    path="$(readlink -f -- "$path" 2>/dev/null)" ||
+        die "path does not exist."
+
+
+    printf '%s\n' "$path"
+}
+
+carry_home() {
+    local workspace="$1"
+    local choice path
+    local -a selections
+
+    require_fzf
+
+    while true; do
+        choice="$(
+            printf '%s\n' \
+                'nothing' \
+                'select from HOME' \
+                'custom path' \
+                'done' |
+                fzf \
+                    --height=50% \
+                    --layout=reverse \
+                    --border \
+                    --prompt='carry over > ' \
+                    --header='what files do you want to carry over from?'
+        )" || return 0
+
+        case "$choice" in
+            nothing)
+                return 0
+                ;;
+
+            'select from HOME')
+                mapfile -t selections < <(
+                        fzf \
+                            --multi \
+                            --height=70% \
+                            --layout=reverse \
+                            --border \
+			    --walker=file,dir,hidden \
+			    --walker-root="$REAL_HOME" \
+                            --prompt='HOME > ' \
+                            --header='tab: select • enter: carry • esc: back' 
+                ) || continue
+
+                for path in "${selections[@]}"; do
+                    [[ -n "$path" ]] || continue
+                    copy_entry "$path" "$workspace"
+                done
+                ;;
+
+            'custom path')
+                path="$(carry_custom)" || continue
+                copy_entry "$path" "$workspace" true
+                ;;
+
+            done)
+                return 0
+                ;;
+        esac
+    done
+}
+
+create_with_carry() {
+    local random="$1"
+    local path
+
+    path="$(create_workspace "$random")"
+
+    if ! carry_home "$path"; then
+        rm -rf -- "$path"
+        die "workspace creation cancelled."
+    fi
+
+    printf 'created: %s\n' "$path"
+}
+
+open_workspace() {
+    local path="$1"
+
+    is_workspace "$path" ||
+        die "workspace is no longer valid."
+
+    mkdir -p -- \
+        "$path/.config" \
+        "$path/.local/share" \
+        "$path/.local/state" \
+        "$path/.cache"
+
+    chmod 700 -- \
+        "$path/.config" \
+        "$path/.local" \
+        "$path/.local/share" \
+        "$path/.local/state" \
+        "$path/.cache"
+
+    (
+        cd -- "$path"
+
+        export TMPUSER_WORKSPACE="$path"
+        export HOME="$path"
+        export XDG_CONFIG_HOME="$path/.config"
+        export XDG_DATA_HOME="$path/.local/share"
+        export XDG_STATE_HOME="$path/.local/state"
+        export XDG_CACHE_HOME="$path/.cache"
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        exec "$LOGIN_SHELL"
+    )
+}
+
+watch_once() {
+    local path="$1"
+    local used quota remaining percent
+
+    used="$(usage_bytes "$path")" || return 1
+
+    printf 'TMPUser • live monitor\n'
+    printf '%s\n\n' "$path"
+    printf 'used: %s\n' "$(format_size "$used")"
+
+    quota="$(get_quota "$path" || true)"
+
+    if [[ "$quota" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'quota: %s\n' "$(format_size "$quota")"
+
+        percent="$(
+            awk -v u="$used" -v q="$quota" \
+                'BEGIN { printf "%.1f", u/q*100 }'
+        )"
+
+        if (( used > quota )); then
+            remaining=$((used - quota))
+            printf 'over by: %s\n' "$(format_size "$remaining")"
+            printf 'usage: %s%%\n' "$percent"
+            printf 'status: OVER QUOTA\n'
+        else
+            remaining=$((quota - used))
+            printf 'remaining: %s\n' "$(format_size "$remaining")"
+            printf 'usage: %s%%\n' "$percent"
+            printf 'status: OK\n'
+        fi
+    else
+        printf 'quota: none\n'
+    fi
+
+    printf '\nCtrl+C to return.\n'
+    printf '\n(outside of TUI so it could be live.)\n'
+}
+
+watch_workspace() {
+    local path="$1"
+
+    is_workspace "$path" ||
+        die "workspace is no longer valid."
+
+    while true; do
+        is_workspace "$path" || break
+        clear
+        watch_once "$path" || break
+        sleep 2 || break
+    done
+}
+
+tui_message() {
+    local message="$1"
+
+    printf '%s\n' "$message" |
+        fzf \
+            --height=25% \
+            --layout=reverse \
+            --border \
+            --no-input \
+            --header='TMPUser'
+}
+
+tui_show() {
+    show_status |
+        fzf \
+            --height=70% \
+            --layout=reverse \
+            --border \
+            --no-input \
+            --header='TMPUser • workspaces'
+}
+
+tui_info() {
+    local path output
+
+    path="$(fzf_workspace)" || return 0
+    output="$(workspace_info "$path")"
+
+    printf '%s\n' "$output" |
+        fzf \
+            --height=70% \
+            --layout=reverse \
+            --border \
+            --no-input \
+            --header='TMPUser • workspace information'
+}
+
+tui_delete() {
+    local path
+
+    while true; do
+        path="$(fzf_workspace)" || return 0
+
+        if confirm "delete '$path' and everything inside?"; then
+            delete_workspace "$path"
+            tui_message "workspace deleted."
+        fi
+    done
+}
+
+tui_empty() {
+    local path
+
+    while true; do
+        path="$(fzf_workspace)" || return 0
+
+        if confirm "empty '$path' but keep the workspace?"; then
+            empty_workspace "$path"
+            tui_message "workspace emptied."
+        fi
+    done
+}
+
+tui_quota() {
+    local path size bytes
+
+    while true; do
+        path="$(fzf_workspace)" || return 0
+
+	printf 'quota size (500M, 1.5G, 1024MiB) > ' >/dev/tty
+	read -r size </dev/tty || return 0
+
+        [[ -n "$size" ]] || continue
+
+        bytes="$(parse_size "$size")" || {
+            tui_message "invalid quota."
+            continue
+        }
+
+        set_quota "$path" "$bytes"
+        tui_message "quota set to $(format_size "$bytes")."
+    done
+}
+
+tui_remove_quota() {
+    local path
+
+    while true; do
+        path="$(fzf_workspace)" || return 0
+        clear_quota "$path"
+        tui_message "quota removed."
+    done
+}
+
+tui_open() {
+    local path
+
+    path="$(fzf_workspace)" || return 0
+
+    clear
+    open_workspace "$path"
+    clear
+}
+
+tui_watch() {
+    local path
+
+    path="$(fzf_workspace)" || return 0
+
+    trap 'TUI_WATCH_STOP=1' INT TERM
+    TUI_WATCH_STOP=0
+
+    while (( ! TUI_WATCH_STOP )); do
+        is_workspace "$path" || break
+
+        clear
+        watch_once "$path" || break
+
+        sleep 2 || break
+    done
+
+    trap - INT TERM
+    TUI_WATCH_STOP=0
+}
+
+menu() {
+    clear
+    local choice
+
+    require_fzf
+
+    while true; do
+        choice="$(
+            printf '%s\n' \
+                'create workspace' \
+                'create random workspace' \
+                'show workspaces' \
+                'workspace information' \
+                'delete workspace' \
+                'empty workspace' \
+                'set quota' \
+                'remove quota' \
+                'open workspace shell' \
+                'watch workspace' \
+                'exit' |
+                fzf \
+                    --height=65% \
+                    --layout=reverse \
+                    --border \
+                    --prompt='TMPUser > ' \
+                    --header='TMPUser • menu'
+        )" || return 0
+
+        case "$choice" in
+            'create workspace')
+                create_with_carry 0 | {
+                    read -r path
+                    tui_message "$path"
+                }
+                ;;
+
+            'create random workspace')
+                create_with_carry 1 | {
+                    read -r path
+                    tui_message "created: $path"
+                }
+                ;;
+
+            'show workspaces')
+                tui_show
+                ;;
+
+            'workspace information')
+                tui_info
+                ;;
+
+            'delete workspace')
+                tui_delete
+                ;;
+
+            'empty workspace')
+                tui_empty
+                ;;
+
+            'set quota')
+                tui_quota
+                ;;
+
+            'remove quota')
+                tui_remove_quota
+                ;;
+
+            'open workspace shell')
+                tui_open
+                ;;
+
+            'watch workspace')
+                tui_watch
+                ;;
+
+            exit)
+                clear
+                return 0
+                ;;
+        esac
+    done
+}
+
+cli_delete() {
+    local path
+
+    path="$(pick_workspace)" || return 0
+
+    if confirm "delete '$path' and everything inside?"; then
+        delete_workspace "$path"
+    fi
+}
+
+cli_empty() {
+    local path
+
+    path="$(pick_workspace)" || return 0
+
+    if confirm "empty '$path' but keep the workspace?"; then
+        empty_workspace "$path"
+    fi
+}
+
+cli_quota() {
+    local path bytes
+
+    if (( $# == 0 )); then
+        path="$(pick_workspace)" || return 0
+        clear_quota "$path"
+        printf 'quota removed.\n'
+        return
+    fi
+
+    (( $# == 1 )) ||
+        die "usage: tmpuser -q [SIZE]"
+
+    bytes="$(parse_size "$1")" ||
+        die "invalid quota. examples: 500M, 1.5G, 1024MiB."
+
+    path="$(pick_workspace)" || return 0
+    set_quota "$path" "$bytes"
+
+    printf 'quota set: %s\n' "$(format_size "$bytes")"
+}
+
+case "${1:-}" in
+    "")
+        if command -v fzf >/dev/null 2>&1; then
+            menu
+        else
+            usage
+        fi
+        ;;
+
+    -c)
+        (( $# == 1 )) || die "usage: tmpuser -c"
+        create_with_carry 0
+        ;;
+
+    -cr)
+        (( $# == 1 )) || die "usage: tmpuser -cr"
+        create_with_carry 1
+        ;;
+
+    -s)
+        (( $# == 1 )) || die "usage: tmpuser -s"
+        show_status
+        ;;
+
+    -i)
+        (( $# == 1 )) || die "usage: tmpuser -i"
+        path="$(pick_workspace)" || exit 0
+        workspace_info "$path"
+        ;;
+
+    -d)
+        (( $# == 1 )) || die "usage: tmpuser -d"
+        cli_delete
+        ;;
+
+    -e)
+        (( $# == 1 )) || die "usage: tmpuser -e"
+        cli_empty
+        ;;
+
+    -q)
+        shift
+        cli_quota "$@"
+        ;;
+
+    -o)
+        (( $# == 1 )) || die "usage: tmpuser -o"
+        path="$(pick_workspace)" || exit 0
+        open_workspace "$path"
+        ;;
+
+    -w)
+        (( $# == 1 )) || die "usage: tmpuser -w"
+        path="$(pick_workspace)" || exit 0
+        watch_workspace "$path"
+        ;;
+
+    -f)
+        (( $# == 1 )) || die "usage: tmpuser -f"
+        menu
+        ;;
+
+    -h|--help)
+        (( $# == 1 )) || die "usage: tmpuser -h"
+        usage
+        ;;
+
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
