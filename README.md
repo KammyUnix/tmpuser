@@ -24,4 +24,6 @@ unless.. you just use it to create `/tmp/$user` directory and don't use the main
 
 tl;dr: **magic**, okay just joking, my bad.
 
-basically, it temporarily changes every path to new created "workspace"(aka, directory in your `/tmp` that you created using tmpuser), so yes, if you have custom binaries in your `/home`, it wont work there(but you can carry over)
+basically, it temporarily changes every path to new created "workspace" (aka, directory in your `/tmp` that you created using tmpuser), 
+
+so yes, if you have custom binaries in your `/home`, it wont work there(but you can carry over any files)
