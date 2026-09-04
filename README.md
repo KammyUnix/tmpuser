@@ -28,3 +28,9 @@ tl;dr: **magic**, okay just joking, my bad.
 basically, it temporarily changes every path to new created "workspace" (aka, directory in your `/tmp` that you created using tmpuser), 
 
 so yes, if you have custom binaries in your `/home`, it wont work there(but you can carry over any files)
+
+## known issue
+
+![error picture n1](assets/error n1.jpeg)
+
+i am too lazy to fix, ignore while hopefully after 10 years, i’ll fix this
