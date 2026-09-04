@@ -11,14 +11,17 @@ when you don’t wanna mess up your home directory, but you’re too lazy for co
 ## wat is this?
 
 tl;dr: **temu docker/podman**
+
 TMPUser basically makes your home directory temporarily live in /tmp, making other apps think:
 
 “ah yes, my user’s home directory is /tmp. average classic day.”
 
 think of it like chrooting into /tmp, but kernel and users and etc stay same, except path and home directory variables
+
 unless.. you just use it to create /tmp/$user directory and don't use the main feature of TMPUser. what a pschyopath?!
 
 ## how does it work?
 
 tl;dr: **magic**, okay just joking, my bad.
+
 basically, it temporarily changes every path to new created "workspace"(aka, directory in your /tmp that you created using tmpuser), so yes, if you have custom binaries in your /home, it wont work there(but you can carry over)
