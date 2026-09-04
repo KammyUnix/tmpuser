@@ -29,8 +29,30 @@ basically, it temporarily changes every path to new created "workspace" (aka, di
 
 so yes, if you have custom binaries in your `/home`, it wont work there(but you can carry over any files)
 
+## installation
+
+grab latest version in releases(if i’ll ever update lol)
+
+`curl -LO https://github.com/KammyUnix/tmpuser/releases/download/v1.0.0/tmpuser.tar.gz`
+
+then extract it
+
+`tar -xzf tmpuser.tar.gz`
+
+and use it!
+
+`./tmpuser`
+
+**optionally, you can add to PATH**
+
 ## known issue
 
 ![error picture n1](assets/error%20n1.jpeg)
 
 i am too lazy to fix, ignore while hopefully after 10 years, i’ll fix this
+
+## contributing
+
+this shit is held together with tapes and hope, and probably has hundreds of security holes
+
+please, if you can, make this code better🙏
