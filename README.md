@@ -31,6 +31,6 @@ so yes, if you have custom binaries in your `/home`, it wont work there(but you 
 
 ## known issue
 
-![error picture n1](assets/error n1.jpeg)
+![error picture n1](assets/error%20n1.jpeg)
 
 i am too lazy to fix, ignore while hopefully after 10 years, i’ll fix this
