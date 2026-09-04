@@ -52,7 +52,7 @@ and use it!
 i am too lazy to fix, ignore while hopefully after 10 years, i’ll fix this
 
 
-and, **it doesn't work on other unix-like or unix-based distros**, sorry bsd and macos folks, only linux(windows only through wsl)
+and, **it doesn't work on other unix-like or unix-based distros**, sorry bsd and macos folks, linux only(windows only through wsl)
 
 ## contributing
 
